@@ -36,6 +36,12 @@ name: Build neonize for Apple Silicon
 on:
   workflow_dispatch:
 
+# Needed by the last step, which commits the built file back into this
+# repository so it can be fetched directly, without going through the
+# Actions artifact zip.
+permissions:
+  contents: write
+
 env:
   # The upstream commit this workflow's patches were written against.
   WHATSMEOW: v0.0.0-20261116172437-19d61352436f
@@ -50,6 +56,11 @@ jobs:
                                # any step runs, with the job showing as
                                # "cancelled" after about a second.
     steps:
+      # Must come before the neonize clone, because this wipes the
+      # workspace before it writes into it.
+      - name: Check out this repo
+        uses: actions/checkout@v4
+
       - name: Confirm this really is Apple Silicon
         run: |
           echo "arch:    $(uname -m)"
@@ -179,3 +190,25 @@ jobs:
           name: neonize-darwin-arm64
           path: src/goneonize/neonize-darwin-arm64.dylib
           if-no-files-found: error
+
+      # Artifacts are only downloadable as a zip, from a storage host that
+      # is not always reachable. Committing the file into the repo as well
+      # means it can be fetched directly over plain HTTPS.
+      # Only dist/ is staged, so the cloned neonize source in src/ is never
+      # committed.
+      - name: Publish the dylib into this repo
+        run: |
+          mkdir -p dist
+          cp src/goneonize/neonize-darwin-arm64.dylib dist/
+          ls -l dist/
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f dist/neonize-darwin-arm64.dylib
+          if git diff --cached --quiet; then
+            echo "Identical file already committed, nothing to do."
+          else
+            git commit -m "Built dylib, whatsmeow ${WHATSMEOW}"
+            git push
+            echo "Pushed to dist/neonize-darwin-arm64.dylib"
+          fi
