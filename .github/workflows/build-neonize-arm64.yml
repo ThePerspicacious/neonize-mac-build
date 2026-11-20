@@ -14,7 +14,8 @@
 # instead of on the client's machine.
 #
 # HOW TO USE IT
-#   1. Make a new repository on GitHub (private is fine, and preferable).
+#   1. Make a new PUBLIC repository on GitHub (public keeps the macOS
+#      minutes free; private bills them at a 10x rate).
 #   2. Save this file as  .github/workflows/build-neonize-arm64.yml
 #   3. Actions tab -> "Build neonize for Apple Silicon" -> Run workflow.
 #   4. When it finishes, download the artifact from the run page.
@@ -34,12 +35,26 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14          # Apple Silicon runner
+    runs-on: macos-latest      # Apple Silicon. Do not pin a version number
+                               # here: GitHub retires the numbered macOS
+                               # labels, and a retired one is refused before
+                               # any step runs, with the job showing as
+                               # "cancelled" after about a second.
     steps:
+      - name: Confirm this really is Apple Silicon
+        run: |
+          echo "arch:    $(uname -m)"
+          sw_vers
+          if [ "$(uname -m)" != "arm64" ]; then
+            echo "This runner is not Apple Silicon, so the dylib it builds"
+            echo "would not load on an M-series Mac. Stopping."
+            exit 1
+          fi
+
       - name: Install Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: 'stable'
 
       - name: Fetch the neonize source
         run: |
