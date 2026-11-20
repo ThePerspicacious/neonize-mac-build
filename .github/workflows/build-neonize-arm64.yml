@@ -7,11 +7,11 @@
 # "Getting a code from WhatsApp...". Upgrading the Python package does not
 # help: every release up to 0.10.0 carries the same stale binary.
 #
-# The fix is to rebuild that component against current upstream whatsmeow.
+# The fix is to rebuild that component against newer upstream whatsmeow.
 # That has to happen on a Mac, because the output is a macOS arm64 dylib and
-# cross-compiling CGO for macOS needs Apple's own toolchain. GitHub's
-# macos-14 runners are Apple Silicon and free, so the build happens there
-# instead of on the client's machine.
+# cross-compiling CGO for macOS needs Apple's own toolchain. GitHub's macOS
+# runners are Apple Silicon and are free for public repositories, so the
+# build happens there instead of on the client's machine.
 #
 # HOW TO USE IT
 #   1. Make a new PUBLIC repository on GitHub (public keeps the macOS
@@ -22,16 +22,25 @@
 #   5. Put the .dylib inside a folder called  patched/  next to app.py.
 #      START_HERE_mac.command detects the chip and installs it by itself.
 #
-# IF THE BUILD FAILS
-# Upstream whatsmeow changes its interface from time to time, which shows up
-# as "not enough arguments in call to ..." or "undefined field". That is
-# normal and it is what the patch step below is already handling for two
-# earlier changes. Send me the log and I will add the next patch.
+# WHY whatsmeow IS PINNED AND NOT @latest
+# Upstream changes its interface every few months, and each change breaks
+# the build until a patch below is written for it. @latest means the build
+# can start failing on a day when nothing on our side changed. The pinned
+# commit below is from 16 Nov 2026, is known to work with the patches here,
+# and is far newer than the 21 Sep build that WhatsApp rejects, which is the
+# only thing that actually matters. To move it forward later, bump the
+# version and expect to add a patch.
 
 name: Build neonize for Apple Silicon
 
 on:
   workflow_dispatch:
+
+env:
+  # The upstream commit this workflow's patches were written against.
+  WHATSMEOW: v0.0.0-20261116172437-19d61352436f
+  # The build WhatsApp rejects. The output must not contain this.
+  BROKEN_STAMP: '20260921121126'
 
 jobs:
   build:
@@ -59,54 +68,82 @@ jobs:
       - name: Fetch the neonize source
         run: |
           git clone --depth 1 --branch 0.10.0 \
-            https://github.com/krypton-byte/neonize src \
-            || git clone --depth 1 https://github.com/krypton-byte/neonize src
+            https://github.com/krypton-byte/neonize src
 
-      - name: Move to current whatsmeow
+      - name: Move to the pinned whatsmeow
         working-directory: src/goneonize
         env:
           GOFLAGS: -mod=mod
           GOTOOLCHAIN: auto
         run: |
           echo "before: $(grep -oE 'whatsmeow v[^ ]+' go.mod)"
-          go get -u go.mau.fi/whatsmeow@latest
+          go get "go.mau.fi/whatsmeow@${WHATSMEOW}"
           go mod tidy
           echo "after:  $(grep -oE 'whatsmeow v[^ ]+' go.mod)"
 
+      # Each patch below asserts that it actually applied. A patch that
+      # silently matches nothing is worse than a failure, because the build
+      # then fails later with a confusing error, or reports success after
+      # changing nothing.
       - name: Apply the known API changes
         working-directory: src/goneonize
         run: |
           python3 - <<'PATCH'
-          import pathlib, sys
+          import re, pathlib, sys
 
-          # 1. whatsmeow renamed the Blocklist field: JIDs -> Items[].PN
+          failures = []
+
+          def need(n, label):
+              if n:
+                  print(f"  ok      {label}  ({n} site{'s' if n > 1 else ''})")
+              else:
+                  print(f"  MISSING {label}")
+                  failures.append(label)
+
+          # 1. types.Blocklist dropped its JIDs field. It now carries
+          #    Items []BlocklistItem, where each item has LID, PN and Active.
+          #    The old JIDs field held phone-number JIDs, so .PN is the
+          #    faithful replacement.
           enc = pathlib.Path("utils/encoder.go")
-          if enc.exists():
-              s = enc.read_text()
-              if "Blocklist.JIDs" in s or ".JIDs" in s:
-                  s = s.replace("evt.JIDs", "evt.Items")
-                  s = s.replace("Blocklist.JIDs", "Blocklist.Items")
-                  enc.write_text(s)
-                  print("patched utils/encoder.go")
+          s = enc.read_text()
+          pat = re.compile(
+              r'for\s+_,\s*jid\s*:=\s*range\s+blocklist\.JIDs\s*\{\s*\n(\s*)'
+              r'JIDs\s*=\s*append\(JIDs,\s*EncodeJidProto\(jid\)\)')
+          s, n = pat.subn(
+              lambda m: ('for _, item := range blocklist.Items {\n'
+                         + m.group(1)
+                         + 'JIDs = append(JIDs, EncodeJidProto(item.PN))'),
+              s)
+          enc.write_text(s)
+          need(n, "encoder.go EncodeBlocklist -> Items/.PN")
 
-          # 2. UpdateBlocklist and GetBlocklist both gained a dhash argument
+          # 2 and 3. UpdateBlocklist and GetBlocklist both gained a trailing
+          #          dhash argument.
           main = pathlib.Path("main.go")
           s = main.read_text()
-          pairs = [
+          for old, new, label in [
               ('UpdateBlocklist(context.Background(), utils.DecodeJidProto(&JID), '
                'events.BlocklistChangeAction(C.GoString(action)))',
                'UpdateBlocklist(context.Background(), utils.DecodeJidProto(&JID), '
-               'events.BlocklistChangeAction(C.GoString(action)), "")'),
+               'events.BlocklistChangeAction(C.GoString(action)), "")',
+               "main.go UpdateBlocklist dhash arg"),
               ('GetBlocklist(context.Background())',
-               'GetBlocklist(context.Background(), "")'),
-          ]
-          hit = 0
-          for old, new in pairs:
-              if old in s:
-                  s = s.replace(old, new)
-                  hit += 1
+               'GetBlocklist(context.Background(), "")',
+               "main.go GetBlocklist dhash arg"),
+          ]:
+              c = s.count(old)
+              s = s.replace(old, new)
+              need(c, label)
           main.write_text(s)
-          print(f"patched main.go, {hit} call site(s)")
+
+          if failures:
+              print()
+              print("One or more patches did not apply. Upstream has most")
+              print("likely changed again. Send this log on rather than")
+              print("shipping a binary built from a half-patched source.")
+              sys.exit(1)
+          print()
+          print("all patches applied")
           PATCH
 
       - name: Build the dylib
@@ -121,15 +158,18 @@ jobs:
           ls -la neonize-darwin-arm64.dylib
           file neonize-darwin-arm64.dylib
 
-      - name: Confirm the stale build is actually gone
+      - name: Confirm it is a real arm64 dylib and not the stale build
         working-directory: src/goneonize
         run: |
+          file neonize-darwin-arm64.dylib | grep -q 'arm64' || {
+            echo "Output is not arm64. Stopping."; exit 1; }
+
           STAMP=$(strings -n 6 neonize-darwin-arm64.dylib \
                   | grep -oE 'whatsmeow@v[0-9.]+-[0-9]{14}' \
                   | grep -oE '[0-9]{14}' | sort -u | head -1)
           echo "whatsmeow build inside the dylib: ${STAMP:-unknown}"
-          if [ "$STAMP" = "20260921121126" ]; then
-            echo "This is still the broken build. Do not ship it."
+          if [ "$STAMP" = "$BROKEN_STAMP" ]; then
+            echo "This is still the build WhatsApp rejects. Do not ship it."
             exit 1
           fi
 
