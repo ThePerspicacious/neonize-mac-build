@@ -1,0 +1,126 @@
+# Build a working neonize binary for Apple Silicon.
+#
+# WHY THIS EXISTS
+# neonize ships a pre-compiled Go library (whatsmeow) inside its Python
+# package. The published build is dated 21 Sep 2026, and WhatsApp now
+# rejects clients built from it, which is why QR pairing hangs forever on
+# "Getting a code from WhatsApp...". Upgrading the Python package does not
+# help: every release up to 0.10.0 carries the same stale binary.
+#
+# The fix is to rebuild that component against current upstream whatsmeow.
+# That has to happen on a Mac, because the output is a macOS arm64 dylib and
+# cross-compiling CGO for macOS needs Apple's own toolchain. GitHub's
+# macos-14 runners are Apple Silicon and free, so the build happens there
+# instead of on the client's machine.
+#
+# HOW TO USE IT
+#   1. Make a new repository on GitHub (private is fine, and preferable).
+#   2. Save this file as  .github/workflows/build-neonize-arm64.yml
+#   3. Actions tab -> "Build neonize for Apple Silicon" -> Run workflow.
+#   4. When it finishes, download the artifact from the run page.
+#   5. Put the .dylib inside a folder called  patched/  next to app.py.
+#      START_HERE_mac.command detects the chip and installs it by itself.
+#
+# IF THE BUILD FAILS
+# Upstream whatsmeow changes its interface from time to time, which shows up
+# as "not enough arguments in call to ..." or "undefined field". That is
+# normal and it is what the patch step below is already handling for two
+# earlier changes. Send me the log and I will add the next patch.
+
+name: Build neonize for Apple Silicon
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14          # Apple Silicon runner
+    steps:
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Fetch the neonize source
+        run: |
+          git clone --depth 1 --branch 0.10.0 \
+            https://github.com/krypton-byte/neonize src \
+            || git clone --depth 1 https://github.com/krypton-byte/neonize src
+
+      - name: Move to current whatsmeow
+        working-directory: src/goneonize
+        env:
+          GOFLAGS: -mod=mod
+          GOTOOLCHAIN: auto
+        run: |
+          echo "before: $(grep -oE 'whatsmeow v[^ ]+' go.mod)"
+          go get -u go.mau.fi/whatsmeow@latest
+          go mod tidy
+          echo "after:  $(grep -oE 'whatsmeow v[^ ]+' go.mod)"
+
+      - name: Apply the known API changes
+        working-directory: src/goneonize
+        run: |
+          python3 - <<'PATCH'
+          import pathlib, sys
+
+          # 1. whatsmeow renamed the Blocklist field: JIDs -> Items[].PN
+          enc = pathlib.Path("utils/encoder.go")
+          if enc.exists():
+              s = enc.read_text()
+              if "Blocklist.JIDs" in s or ".JIDs" in s:
+                  s = s.replace("evt.JIDs", "evt.Items")
+                  s = s.replace("Blocklist.JIDs", "Blocklist.Items")
+                  enc.write_text(s)
+                  print("patched utils/encoder.go")
+
+          # 2. UpdateBlocklist and GetBlocklist both gained a dhash argument
+          main = pathlib.Path("main.go")
+          s = main.read_text()
+          pairs = [
+              ('UpdateBlocklist(context.Background(), utils.DecodeJidProto(&JID), '
+               'events.BlocklistChangeAction(C.GoString(action)))',
+               'UpdateBlocklist(context.Background(), utils.DecodeJidProto(&JID), '
+               'events.BlocklistChangeAction(C.GoString(action)), "")'),
+              ('GetBlocklist(context.Background())',
+               'GetBlocklist(context.Background(), "")'),
+          ]
+          hit = 0
+          for old, new in pairs:
+              if old in s:
+                  s = s.replace(old, new)
+                  hit += 1
+          main.write_text(s)
+          print(f"patched main.go, {hit} call site(s)")
+          PATCH
+
+      - name: Build the dylib
+        working-directory: src/goneonize
+        env:
+          CGO_ENABLED: '1'
+          GOOS: darwin
+          GOARCH: arm64
+        run: |
+          go build -buildmode=c-shared -ldflags=-s \
+            -o neonize-darwin-arm64.dylib .
+          ls -la neonize-darwin-arm64.dylib
+          file neonize-darwin-arm64.dylib
+
+      - name: Confirm the stale build is actually gone
+        working-directory: src/goneonize
+        run: |
+          STAMP=$(strings -n 6 neonize-darwin-arm64.dylib \
+                  | grep -oE 'whatsmeow@v[0-9.]+-[0-9]{14}' \
+                  | grep -oE '[0-9]{14}' | sort -u | head -1)
+          echo "whatsmeow build inside the dylib: ${STAMP:-unknown}"
+          if [ "$STAMP" = "20260921121126" ]; then
+            echo "This is still the broken build. Do not ship it."
+            exit 1
+          fi
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: neonize-darwin-arm64
+          path: src/goneonize/neonize-darwin-arm64.dylib
+          if-no-files-found: error
